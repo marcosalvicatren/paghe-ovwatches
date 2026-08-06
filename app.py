@@ -22,7 +22,7 @@ from models import TipoPagina, DareAvere  # noqa: E402
 from pdf_classifier import classifica_pdf  # noqa: E402
 from payroll_parser import estrai_bilancino  # noqa: E402
 from f24_parser import estrai_f24  # noqa: E402
-from rule_engine import carica_regole, salva_regole  # noqa: E402
+from rule_engine import carica_regole, salva_regole, genera_mappatura_da_voci  # noqa: E402
 from accounting_builder import (  # noqa: E402
     costruisci_registrazione_paghe, costruisci_registrazione_f24, verifica_quadratura,
 )
@@ -187,7 +187,7 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix):
                 st.info(f"Regole candidate in conflitto: {', '.join(ecc.regole_candidate)}")
 
             c1, c2, c3 = st.columns(3)
-            conto = c1.text_input("Conto", key=f"{key_prefix}_conto_{i}")
+            conto = c1.text_input("Conto nel gestionale", key=f"{key_prefix}_conto_{i}")
             da = c2.selectbox("Dare/Avere", ["D", "A"], key=f"{key_prefix}_da_{i}")
             ambito = c3.selectbox(
                 "Applica a",
@@ -397,45 +397,78 @@ def pagina_f24():
 # ─────────────────────────────────────────────────────────────────────────
 
 def pagina_regole():
-    st.title("⚙️ Regole di contabilizzazione")
+    st.title("⚙️ Mappatura voci → conti del gestionale")
     st.caption(
-        "Le regole vengono valutate in ordine di priorità (più alta prima); a parità di priorità vince "
-        "una regola con azienda specifica su una generale. 'attiva=false' disattiva una regola senza "
-        "cancellarla, per mantenerne lo storico."
+        "Il PDF paghe usa i codici conto del software paghe: NON sono gli stessi conti del tuo "
+        "gestionale. Per ogni voce indica qui il conto corretto del gestionale — finché una voce "
+        "non ha un conto, resta in 'Eccezioni' e non entra nell'XML."
     )
     token, repo, branch = _gh_config()
 
     tab_bp, tab_f24 = st.tabs(["Buste paga", "F24"])
-    for tab, tipo, chiave in [(tab_bp, "buste_paga", "regole_bp"), (tab_f24, "f24", "regole_f24")]:
+    for tab, tipo, chiave, righe_chiave in [
+        (tab_bp, "buste_paga", "regole_bp", "bp_righe"),
+        (tab_f24, "f24", "regole_f24", "f24_righe"),
+    ]:
         with tab:
             if st.session_state[chiave] is None:
                 st.session_state[chiave] = carica_regole(tipo, token, repo, branch)
+
+            # precompila con le voci reali già estratte in questa sessione,
+            # così la tabella non parte vuota: mostra esattamente le voci
+            # del TUO PDF, non un elenco astratto.
+            righe_estratte = st.session_state.get(righe_chiave)
+            if righe_estratte:
+                campo = "descrizione" if tipo == "buste_paga" else "codice"
+                voci = [getattr(r, campo) for r in righe_estratte]
+                st.session_state[chiave] = genera_mappatura_da_voci(voci, tipo, st.session_state[chiave])
+
             df = pd.DataFrame(st.session_state[chiave])
-            for col in ["contiene", "non_contiene", "conto_override", "segno_atteso",
-                        "priorita", "scope_azienda", "attiva", "note"]:
+            for col in ["descrizione_regola", "conto_override", "segno_atteso", "attiva",
+                        "contiene", "non_contiene", "priorita", "scope_azienda", "note"]:
                 if col not in df.columns:
                     df[col] = "" if col not in ("attiva", "priorita") else (True if col == "attiva" else 100)
             df["contiene"] = df["contiene"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
             df["non_contiene"] = df["non_contiene"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
 
+            n_da_mappare = int((df["conto_override"].astype(str).str.strip() == "").sum())
+            if n_da_mappare:
+                st.warning(f"{n_da_mappare} voce/i ancora senza conto del gestionale.")
+            else:
+                st.success("Tutte le voci hanno un conto assegnato.")
+
+            avanzate = st.checkbox("Mostra colonne avanzate (pattern, priorità, azienda specifica...)",
+                                    key=f"avanzate_{tipo}")
+            colonne_semplici = ["descrizione_regola", "conto_override", "segno_atteso", "attiva"]
+            colonne_avanzate = colonne_semplici + ["contiene", "non_contiene", "priorita", "scope_azienda", "note"]
+
             edited = st.data_editor(
                 df,
+                column_order=colonne_avanzate if avanzate else colonne_semplici,
                 column_config={
-                    "contiene": st.column_config.TextColumn("Contiene", width="medium"),
-                    "non_contiene": st.column_config.TextColumn("NON contiene", width="medium"),
-                    "segno_atteso": st.column_config.SelectboxColumn("D/A", options=["", "D", "A"]),
+                    "descrizione_regola": st.column_config.TextColumn(
+                        "Voce (come compare nel PDF)", width="large", disabled=(not avanzate)),
+                    "conto_override": st.column_config.TextColumn(
+                        "Conto nel gestionale", width="medium",
+                        help="Il conto corretto nel TUO gestionale per questa voce. Lascia vuoto se non sai ancora quale usare."),
+                    "segno_atteso": st.column_config.SelectboxColumn(
+                        "Dare/Avere", options=["", "D", "A"],
+                        help="Da compilare solo se questa voce non ha già un D/A esplicito sul PDF."),
                     "attiva": st.column_config.CheckboxColumn("Attiva"),
+                    "contiene": st.column_config.TextColumn("Pattern aggiuntivo (avanzato)", width="medium"),
+                    "non_contiene": st.column_config.TextColumn("NON contiene (avanzato)", width="medium"),
                     "priorita": st.column_config.NumberColumn("Priorità"),
+                    "scope_azienda": st.column_config.TextColumn("Solo per azienda (vuoto = tutte)"),
                 },
                 num_rows="dynamic", width='stretch', key=f"editor_{tipo}",
             )
-            if st.button(f"💾 Salva regole {tipo}", key=f"salva_{tipo}"):
+            if st.button(f"💾 Salva mappatura {tipo}", width='stretch', key=f"salva_{tipo}"):
                 nuove = edited.to_dict("records")
                 for r in nuove:
                     r["contiene"] = [x.strip() for x in str(r.get("contiene", "")).split(",") if x.strip()]
                     r["non_contiene"] = [x.strip() for x in str(r.get("non_contiene", "")).split(",") if x.strip()]
                 st.session_state[chiave] = nuove
-                ok, msg = salva_regole(tipo, nuove, token, repo, branch, f"Aggiornamento regole {tipo}")
+                ok, msg = salva_regole(tipo, nuove, token, repo, branch, f"Aggiornamento mappatura {tipo}")
                 (st.success if ok else st.error)(msg)
 
 
