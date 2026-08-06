@@ -49,18 +49,27 @@ def costruisci_registrazione_paghe(
 
     for r in righe:
         regola = trova_regola(r.descrizione, regole, scope_azienda)
-        conto = (regola.get("conto_override") if regola else "") or r.conto
+        # IMPORTANTE: il conto del bilancino è quello del software paghe, non
+        # necessariamente quello del gestionale di destinazione. Non lo si usa
+        # mai come ripiego: senza una mappatura esplicita (conto_override
+        # valorizzato) la voce resta in sospeso, in "Eccezioni".
+        conto = (regola.get("conto_override") or "").strip() if regola else ""
 
         if r.da is not None:
-            reg.movimenti.append(MovimentoContabile(
-                conto=conto, descrizione=r.descrizione, importo=r.importo, da=r.da,
-                causale=causale, pagina_origine=r.pagina,
-                regola_applicata=regola["id"] if regola else "(conto da documento, nessuna regola)",
-            ))
+            if conto:
+                reg.movimenti.append(MovimentoContabile(
+                    conto=conto, descrizione=r.descrizione, importo=r.importo, da=r.da,
+                    causale=causale, pagina_origine=r.pagina, regola_applicata=regola["id"],
+                ))
+            else:
+                eccezioni.append(Eccezione(
+                    riga_originale=r, motivo="conto_non_mappato",
+                    regole_candidate=[regola["id"]] if regola else [],
+                ))
             continue
 
-        # riga ambigua: serve una regola attiva con segno_atteso
-        if regola and regola.get("segno_atteso") and regola.get("attiva", True):
+        # riga ambigua: serve una mappatura attiva con segno atteso E conto
+        if regola and regola.get("segno_atteso") and regola.get("attiva", True) and conto:
             reg.movimenti.append(MovimentoContabile(
                 conto=conto, descrizione=r.descrizione, importo=r.importo,
                 da=DareAvere(regola["segno_atteso"]),
@@ -137,9 +146,13 @@ def costruisci_registrazione_f24(
 def verifica_quadratura(reg: RegistrazioneContabile, eccezioni: list[Eccezione]) -> RisultatoValidazione:
     errori, avvisi = [], []
     if eccezioni:
-        avvisi.append(
-            f"{len(eccezioni)} riga/e non contabilizzata/e (nessuna regola attiva): "
-            "l'XML non includerà questi importi finché non vengono risolte."
+        # Bloccante, non solo un avviso: una voce senza conto mappato non è
+        # un dettaglio opzionale, significa che l'XML sarebbe incompleto o
+        # userebbe (per le altre righe) conti del software paghe non validi
+        # nel gestionale. Richiede una mappatura o una forzatura esplicita.
+        errori.append(
+            f"{len(eccezioni)} voce/i senza conto del gestionale assegnato: "
+            "vai su 'Mappatura conti' oppure risolvile qui sotto in 'Eccezioni'."
         )
     if not reg.quadrata:
         errori.append(

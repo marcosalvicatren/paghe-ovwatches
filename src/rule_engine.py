@@ -87,10 +87,31 @@ def salva_regole(tipo: str, regole: list[dict], token: str | None = None, repo: 
     return True, f"GitHub non disponibile: salvato in locale ({path_locale})"
 
 
-def _applica_pattern(testo_lower: str, regola: dict) -> bool:
-    for c in regola.get("contiene", []):
-        if c.lower() not in testo_lower:
-            return False
+def _applica_pattern(testo: str, regola: dict) -> bool:
+    testo_lower = testo.lower()
+    if regola.get("contiene"):
+        # pattern avanzato impostato esplicitamente dall'utente: match per
+        # sottostringa, case-insensitive (comportamento flessibile voluto).
+        for c in regola["contiene"]:
+            if c.lower() not in testo_lower:
+                return False
+        for nc in regola.get("non_contiene", []):
+            if nc.lower() in testo_lower:
+                return False
+        return True
+
+    # Nessun pattern avanzato: si usa il testo della "Voce" così com'è stato
+    # visto sul PDF, con corrispondenza ESATTA e sensibile alle maiuscole.
+    # Necessario perché lo stesso documento può avere due righe reali e
+    # DISTINTE che differiscono solo per maiuscole/minuscole (es. "Irpef
+    # Collaboratori" a Dare vs "Irpef collaboratori" ad Avere, viste su
+    # questo stesso bilancino): un confronto case-insensitive le fonderebbe
+    # per errore in un'unica mappatura, perdendo la distinzione.
+    voce = regola.get("descrizione_regola", "").strip()
+    if not voce:
+        return False
+    if testo.strip() != voce:
+        return False
     for nc in regola.get("non_contiene", []):
         if nc.lower() in testo_lower:
             return False
@@ -101,10 +122,9 @@ def trova_regola(testo_matching: str, regole: list[dict], scope_azienda: str | N
     """Trova la regola con priorità più alta che matcha. Le regole con
     scope specifico per azienda vincono su quelle generali a parità di
     priorità (gerarchia richiesta dalla specifica)."""
-    testo_lower = testo_matching.lower()
     candidate = [
         r for r in regole
-        if r.get("attiva", True) and _applica_pattern(testo_lower, r)
+        if r.get("attiva", True) and _applica_pattern(testo_matching, r)
         and (r.get("scope_azienda") in (None, "", scope_azienda))
     ]
     if not candidate:
@@ -116,11 +136,45 @@ def trova_regola(testo_matching: str, regole: list[dict], scope_azienda: str | N
     return candidate[0]
 
 
+def genera_mappatura_da_voci(
+    voci: list[str], tipo_documento: str, regole_esistenti: list[dict],
+) -> list[dict]:
+    """Aggiunge alla lista di regole una riga vuota (conto da compilare) per
+    ogni voce vista nel PDF che non ha ancora una mappatura, così la tabella
+    di mappatura parte già popolata con le voci reali del documento invece
+    che vuota. Non tocca le mappature già esistenti (anche se il conto è
+    ancora vuoto: l'utente potrebbe averlo lasciato così apposta)."""
+    # Sensibile alle maiuscole di proposito: sullo stesso documento possono
+    # comparire due voci reali e distinte che differiscono solo per
+    # maiuscole/minuscole (vedi nota in _applica_pattern) — fondere il
+    # confronto case-insensitive le tratterebbe per errore come la stessa voce.
+    esistenti = {r.get("descrizione_regola", "").strip() for r in regole_esistenti}
+    nuove = list(regole_esistenti)
+    for voce in dict.fromkeys(v.strip() for v in voci if v.strip()):  # dedup, ordine preservato
+        if voce in esistenti:
+            continue
+        esistenti.add(voce)
+        nuove.append({
+            "id": f"{tipo_documento}-{abs(hash(voce)) % 1000000}",
+            "tipo_documento": tipo_documento,
+            "descrizione_regola": voce,
+            "contiene": [],
+            "non_contiene": [],
+            "segno_atteso": "",
+            "conto_override": "",
+            "priorita": 100,
+            "scope_azienda": None,
+            "origine": "estratta_da_pdf",
+            "attiva": True,
+            "note": "",
+        })
+    return nuove
+
+
 def regole_concorrenti(testo_matching: str, regole: list[dict], scope_azienda: str | None = None) -> list[dict]:
     """Tutte le regole attive che matcherebbero (per segnalare conflitti)."""
-    testo_lower = testo_matching.lower()
     return [
         r for r in regole
-        if r.get("attiva", True) and _applica_pattern(testo_lower, r)
+        if r.get("attiva", True) and _applica_pattern(testo_matching, r)
         and (r.get("scope_azienda") in (None, "", scope_azienda))
     ]
