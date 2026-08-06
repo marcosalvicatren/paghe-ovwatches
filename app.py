@@ -10,6 +10,7 @@ secrets di Streamlit, altrimenti gestite in locale).
 
 import sys
 import tempfile
+import calendar
 from datetime import date, datetime
 from pathlib import Path
 
@@ -59,6 +60,27 @@ def _gh_config():
 
 def _sezione(titolo):
     st.markdown(f'<div class="section-header">{titolo}</div>', unsafe_allow_html=True)
+
+
+_MESI_IT = {
+    "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6,
+    "luglio": 7, "agosto": 8, "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12,
+}
+
+
+def _ultimo_giorno_periodo(mese_anno: str) -> date:
+    """Converte 'Dicembre 2025' (come estratto dal bilancino) nell'ultimo
+    giorno di quel mese (31/12/2025) — è la data di competenza più sensata
+    per la registrazione, non la data odierna. Resta comunque un default:
+    il campo in interfaccia è sempre modificabile a mano."""
+    try:
+        nome_mese, anno_str = mese_anno.strip().split()
+        mese_num = _MESI_IT[nome_mese.lower()]
+        anno = int(anno_str)
+        ultimo_giorno = calendar.monthrange(anno, mese_num)[1]
+        return date(anno, mese_num, ultimo_giorno)
+    except (ValueError, KeyError, IndexError, AttributeError):
+        return date.today()
 
 
 for chiave, default in [
@@ -203,7 +225,8 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix, flag_movi
                 "Ambito", [AMBITO_GENERALE, AMBITO_AZIENDA, AMBITO_REGISTRAZIONE],
                 key=f"{key_prefix}_ambito_{i}",
             )
-            if st.button("✅ Applica e salva come regola", key=f"{key_prefix}_salva_{i}") and conto:
+            c4, c5 = st.columns(2)
+            if c4.button("✅ Applica e salva come regola", key=f"{key_prefix}_salva_{i}") and conto:
                 pattern = getattr(r, "descrizione", None) or getattr(r, "codice", "")
                 scope_az, scope_per = scope_da_ambito(ambito, st.session_state.bp_azienda, st.session_state.bp_mese)
                 nuova_regola = {
@@ -213,6 +236,7 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix, flag_movi
                     "contiene": [], "non_contiene": [],
                     "segno_atteso": da,
                     "conto_override": conto,
+                    "escludi": False,
                     "priorita": 100,
                     "scope_azienda": scope_az,
                     "scope_periodo": scope_per,
@@ -231,6 +255,35 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix, flag_movi
                 token, repo, branch = _gh_config()
                 ok, msg = salva_regole(tipo_documento, regole, token, repo, branch, f"Mappatura: {pattern}")
                 st.session_state[flag_movimenti] = False  # forza il ricalcolo dell'Anteprima con la nuova mappatura
+                st.toast(msg, icon="✅" if ok else "⚠️")
+                st.rerun()
+
+            if c5.button("🚫 Escludi questa voce (non mappare, di proposito)", key=f"{key_prefix}_escludi_{i}"):
+                pattern = getattr(r, "descrizione", None) or getattr(r, "codice", "")
+                scope_az, scope_per = scope_da_ambito(ambito, st.session_state.bp_azienda, st.session_state.bp_mese)
+                nuova_regola = {
+                    "id": f"{key_prefix}-{abs(hash(pattern)) % 100000}",
+                    "tipo_documento": tipo_documento,
+                    "descrizione_regola": pattern,
+                    "contiene": [], "non_contiene": [],
+                    "segno_atteso": "", "conto_override": "",
+                    "escludi": True,
+                    "priorita": 100,
+                    "scope_azienda": scope_az,
+                    "scope_periodo": scope_per,
+                    "origine": "utente",
+                    "attiva": True,
+                    "creata_il": datetime.now().isoformat(timespec="seconds"),
+                    "note": "",
+                }
+                esistente = next((x for x in regole if x.get("descrizione_regola") == pattern), None)
+                if esistente:
+                    esistente.update(nuova_regola, id=esistente["id"])
+                else:
+                    regole.append(nuova_regola)
+                token, repo, branch = _gh_config()
+                ok, msg = salva_regole(tipo_documento, regole, token, repo, branch, f"Esclusa: {pattern}")
+                st.session_state[flag_movimenti] = False
                 st.toast(msg, icon="✅" if ok else "⚠️")
                 st.rerun()
 
@@ -307,7 +360,12 @@ def pagina_buste_paga():
         st.session_state.regole_bp = carica_regole("buste_paga", token, repo, branch)
     regole = st.session_state.regole_bp
 
-    data_doc = st.date_input("Data registrazione", value=date.today().replace(day=1))
+    data_doc = st.date_input(
+        "Data registrazione", value=_ultimo_giorno_periodo(st.session_state.bp_mese),
+        help="Precompilata con l'ultimo giorno del mese di competenza (dedotto dal periodo del bilancino: "
+             f"'{st.session_state.bp_mese}'). Modificala liberamente se ti serve una data diversa.",
+        key=f"data_doc_bp_{st.session_state.bp_mese}",  # cambia se cambia il periodo, così il default si aggiorna
+    )
 
     # Le eccezioni si ricalcolano sempre (leggero, riflette lo stato attuale
     # della mappatura). L'Anteprima invece, essendo ora modificabile a mano,
@@ -470,9 +528,11 @@ def pagina_regole():
     st.title("⚙️ Mappatura voci → conti del gestionale")
     st.caption(
         "Il PDF paghe usa i codici conto del software paghe: NON sono gli stessi conti del tuo "
-        "gestionale. Per ogni voce indica qui il conto corretto del gestionale — finché una voce "
-        "non ha un conto, resta in 'Eccezioni' e non entra nell'XML. Per cancellare una riga: "
-        "seleziona il quadratino a sinistra della riga, poi premi Canc/Delete sulla tastiera."
+        "gestionale. Per ogni voce indica qui il conto corretto del gestionale, oppure spunta "
+        "'Escludi' se quella voce non deve generare un movimento (scelta consapevole, diversa da "
+        "'non ancora deciso'). Finché una voce non è né mappata né esclusa, resta in 'Eccezioni' "
+        "e non entra nell'XML. Per cancellare una riga: seleziona il quadratino a sinistra della "
+        "riga, poi premi Canc/Delete sulla tastiera."
     )
     token, repo, branch = _gh_config()
 
@@ -501,12 +561,14 @@ def pagina_regole():
                 st.session_state[flag_chiave] = True
 
             df = pd.DataFrame(st.session_state[chiave])
-            for col in ["descrizione_regola", "conto_override", "segno_atteso", "attiva",
+            for col in ["descrizione_regola", "conto_override", "segno_atteso", "attiva", "escludi",
                         "contiene", "non_contiene", "priorita", "scope_azienda", "scope_periodo"]:
                 if col not in df.columns:
-                    df[col] = "" if col not in ("attiva", "priorita") else (True if col == "attiva" else 100)
+                    df[col] = "" if col not in ("attiva", "priorita", "escludi") else (
+                        100 if col == "priorita" else (True if col == "attiva" else False))
             df["contiene"] = df["contiene"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
             df["non_contiene"] = df["non_contiene"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
+            df["escludi"] = df["escludi"].fillna(False).astype(bool)
             # colonna "Ambito" calcolata per la visualizzazione: traduce le
             # due colonne tecniche (scope_azienda/scope_periodo) in un'unica
             # scelta comprensibile, come richiesto.
@@ -514,15 +576,22 @@ def pagina_regole():
                 lambda r: ambito_da_scope(r.get("scope_azienda") or None, r.get("scope_periodo") or None), axis=1
             )
 
-            n_da_mappare = int((df["conto_override"].astype(str).str.strip() == "").sum())
+            n_da_mappare = int(((df["conto_override"].astype(str).str.strip() == "") & (~df["escludi"])).sum())
+            n_escluse = int(df["escludi"].sum())
+            msg_stato = []
             if n_da_mappare:
-                st.warning(f"{n_da_mappare} voce/i ancora senza conto del gestionale.")
+                msg_stato.append(f"{n_da_mappare} voce/i ancora senza conto del gestionale")
+            if n_escluse:
+                msg_stato.append(f"{n_escluse} voce/i escluse deliberatamente")
+            if n_da_mappare:
+                st.warning(", ".join(msg_stato) + ".")
             else:
-                st.success("Tutte le voci hanno un conto assegnato.")
+                st.success(("Tutte le voci hanno un conto assegnato" if not n_escluse
+                             else f"Tutte le voci sono mappate o escluse ({n_escluse} escluse).") )
 
             avanzate = st.checkbox("Mostra colonne avanzate (pattern testuale, priorità...)",
                                     key=f"avanzate_{tipo}")
-            colonne_semplici = ["descrizione_regola", "conto_override", "segno_atteso", "ambito", "attiva"]
+            colonne_semplici = ["descrizione_regola", "conto_override", "segno_atteso", "ambito", "escludi", "attiva"]
             colonne_avanzate = colonne_semplici + ["contiene", "non_contiene", "priorita"]
 
             edited = st.data_editor(
@@ -534,6 +603,9 @@ def pagina_regole():
                     "conto_override": st.column_config.TextColumn(
                         "Conto nel gestionale", width="medium",
                         help="Il conto corretto nel TUO gestionale per questa voce. Lascia vuoto se non sai ancora quale usare."),
+                    "escludi": st.column_config.CheckboxColumn(
+                        "Escludi", help="Se spuntato: questa voce NON genera un movimento contabile, di proposito "
+                                        "(es. un subtotale già conteggiato altrove). Non resta in sospeso tra le eccezioni."),
                     "segno_atteso": st.column_config.SelectboxColumn(
                         "Dare/Avere", options=["", "D", "A"],
                         help="Da compilare solo se questa voce non ha già un D/A esplicito sul PDF."),
