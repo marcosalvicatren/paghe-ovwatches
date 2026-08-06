@@ -13,23 +13,52 @@ from accounting_builder import (
 FIXTURE = str(Path(__file__).parent / "fixtures" / "esempio_ovwatches.pdf")
 
 
-def test_righe_ambigue_senza_regola_diventano_eccezioni_non_indovinate():
+def test_senza_mappatura_nessun_conto_del_pdf_viene_usato_come_ripiego():
+    """Il conto scritto sul bilancino è quello del software paghe, non del
+    gestionale: senza una mappatura esplicita (conto_override), NESSUNA riga
+    genera un movimento, nemmeno quelle con D/A già esplicito sul documento."""
     _, _, righe = estrai_bilancino(FIXTURE, 6)
     reg, eccezioni = costruisci_registrazione_paghe(righe, regole=[], data_documento=date(2026, 1, 31))
-    assert len(eccezioni) == 3
-    assert len(reg.movimenti) == 13  # solo le righe con D/A esplicito sul documento
+    assert len(eccezioni) == 16
+    assert len(reg.movimenti) == 0
 
 
-def test_regola_attiva_risolve_la_riga_ambigua():
+def test_mappatura_con_conto_valorizzato_genera_il_movimento():
     _, _, righe = estrai_bilancino(FIXTURE, 6)
     regole = [{
-        "id": "t", "contiene": ["netto in busta"], "non_contiene": [],
-        "segno_atteso": "A", "conto_override": "52/05/055", "attiva": True,
+        "id": "t", "descrizione_regola": "Compensi amministratori soci (spa-srl)",
+        "contiene": [], "non_contiene": [], "segno_atteso": "",
+        "conto_override": "6801", "attiva": True, "priorita": 100, "scope_azienda": None,
+    }]
+    reg, eccezioni = costruisci_registrazione_paghe(righe, regole, date(2026, 1, 31))
+    assert any(m.conto == "6801" for m in reg.movimenti)
+    assert not any(getattr(e.riga_originale, "descrizione", "") == "Compensi amministratori soci (spa-srl)" for e in eccezioni)
+
+
+def test_regola_attiva_con_conto_risolve_anche_la_riga_ambigua():
+    _, _, righe = estrai_bilancino(FIXTURE, 6)
+    regole = [{
+        "id": "t", "descrizione_regola": "NETTO IN BUSTA", "contiene": [], "non_contiene": [],
+        "segno_atteso": "A", "conto_override": "5200", "attiva": True,
         "priorita": 100, "scope_azienda": None,
     }]
     reg, eccezioni = costruisci_registrazione_paghe(righe, regole, date(2026, 1, 31))
-    assert any(m.descrizione == "NETTO IN BUSTA" for m in reg.movimenti)
+    assert any(m.descrizione == "NETTO IN BUSTA" and m.conto == "5200" for m in reg.movimenti)
     assert not any(getattr(e.riga_originale, "descrizione", "") == "NETTO IN BUSTA" for e in eccezioni)
+
+
+def test_mappatura_senza_conto_non_basta_anche_se_regola_esiste():
+    """Una riga di mappatura presente ma con conto_override vuoto (voce vista
+    ma non ancora assegnata) deve restare un'eccezione, non passare a vuoto."""
+    _, _, righe = estrai_bilancino(FIXTURE, 6)
+    regole = [{
+        "id": "t", "descrizione_regola": "Compensi amministratori soci (spa-srl)",
+        "contiene": [], "non_contiene": [], "segno_atteso": "",
+        "conto_override": "", "attiva": True, "priorita": 100, "scope_azienda": None,
+    }]
+    reg, eccezioni = costruisci_registrazione_paghe(righe, regole, date(2026, 1, 31))
+    assert not any(m.descrizione == "Compensi amministratori soci (spa-srl)" for m in reg.movimenti)
+    assert any(getattr(e.riga_originale, "descrizione", "") == "Compensi amministratori soci (spa-srl)" for e in eccezioni)
 
 
 def test_f24_senza_regole_non_genera_movimenti_arbitrari():
@@ -40,9 +69,22 @@ def test_f24_senza_regole_non_genera_movimenti_arbitrari():
     assert len(eccezioni) == 4
 
 
-def test_verifica_quadratura_segnala_scrittura_sbilanciata():
+def test_verifica_quadratura_blocca_se_ci_sono_voci_non_mappate():
     _, _, righe = estrai_bilancino(FIXTURE, 6)
     reg, eccezioni = costruisci_registrazione_paghe(righe, regole=[], data_documento=date(2026, 1, 31))
+    esito = verifica_quadratura(reg, eccezioni)
+    assert esito.valido is False
+    assert any("conto del gestionale" in e for e in esito.errori)
+
+
+def test_verifica_quadratura_segnala_scrittura_sbilanciata():
+    _, _, righe = estrai_bilancino(FIXTURE, 6)
+    regole = [
+        {"id": f"t{i}", "descrizione_regola": r.descrizione, "contiene": [], "non_contiene": [],
+         "segno_atteso": "", "conto_override": f"C{i}", "attiva": True, "priorita": 100, "scope_azienda": None}
+        for i, r in enumerate(righe) if r.da is not None
+    ]  # mappa tutte le righe con D/A esplicito ma su conti diversi tra loro: non quadra
+    reg, eccezioni = costruisci_registrazione_paghe(righe, regole, date(2026, 1, 31))
     esito = verifica_quadratura(reg, eccezioni)
     assert esito.valido is False
     assert any("non quadrata" in e for e in esito.errori)
