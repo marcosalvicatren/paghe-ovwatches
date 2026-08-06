@@ -69,12 +69,14 @@ def test_f24_senza_regole_non_genera_movimenti_arbitrari():
     assert len(eccezioni) == 4
 
 
-def test_verifica_quadratura_blocca_se_ci_sono_voci_non_mappate():
+def test_verifica_quadratura_segnala_ma_non_blocca_le_voci_non_mappate():
+    """Le eccezioni sono un avviso: l'utente può comunque completare la
+    scrittura a mano nell'Anteprima (gestito lato interfaccia, non qui)."""
     _, _, righe = estrai_bilancino(FIXTURE, 6)
     reg, eccezioni = costruisci_registrazione_paghe(righe, regole=[], data_documento=date(2026, 1, 31))
     esito = verifica_quadratura(reg, eccezioni)
-    assert esito.valido is False
-    assert any("conto del gestionale" in e for e in esito.errori)
+    assert esito.valido is True
+    assert any("senza conto mappato" in a for a in esito.avvisi)
 
 
 def test_verifica_quadratura_segnala_scrittura_sbilanciata():
