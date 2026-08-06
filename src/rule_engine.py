@@ -26,6 +26,27 @@ import requests
 _CONFIG_DIR = Path(__file__).parent.parent / "config"
 
 
+AMBITO_GENERALE = "Generale (tutte le aziende)"
+AMBITO_AZIENDA = "Solo questa azienda"
+AMBITO_REGISTRAZIONE = "Solo questa registrazione"
+
+
+def ambito_da_scope(scope_azienda: str | None, scope_periodo: str | None) -> str:
+    if scope_periodo:
+        return AMBITO_REGISTRAZIONE
+    if scope_azienda:
+        return AMBITO_AZIENDA
+    return AMBITO_GENERALE
+
+
+def scope_da_ambito(ambito: str, azienda_corrente: str, periodo_corrente: str) -> tuple[str | None, str | None]:
+    if ambito == AMBITO_REGISTRAZIONE:
+        return (azienda_corrente or None), (periodo_corrente or None)
+    if ambito == AMBITO_AZIENDA:
+        return (azienda_corrente or None), None
+    return None, None
+
+
 def _gh_headers(token: str | None):
     return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"} if token else None
 
@@ -118,19 +139,23 @@ def _applica_pattern(testo: str, regola: dict) -> bool:
     return True
 
 
-def trova_regola(testo_matching: str, regole: list[dict], scope_azienda: str | None = None) -> dict | None:
-    """Trova la regola con priorità più alta che matcha. Le regole con
-    scope specifico per azienda vincono su quelle generali a parità di
-    priorità (gerarchia richiesta dalla specifica)."""
+def trova_regola(
+    testo_matching: str, regole: list[dict],
+    scope_azienda: str | None = None, scope_periodo: str | None = None,
+) -> dict | None:
+    """Trova la regola con priorità più alta che matcha. Gerarchia (più
+    specifico vince, a parità di priorità): scope per questa registrazione
+    (azienda + periodo) > scope per azienda > regola generale."""
     candidate = [
         r for r in regole
         if r.get("attiva", True) and _applica_pattern(testo_matching, r)
         and (r.get("scope_azienda") in (None, "", scope_azienda))
+        and (r.get("scope_periodo") in (None, "", scope_periodo))
     ]
     if not candidate:
         return None
     candidate.sort(key=lambda r: (
-        0 if r.get("scope_azienda") else 1,  # scope specifico prima di quello generale
+        0 if r.get("scope_periodo") else (1 if r.get("scope_azienda") else 2),
         -r.get("priorita", 100),
     ))
     return candidate[0]
@@ -164,6 +189,7 @@ def genera_mappatura_da_voci(
             "conto_override": "",
             "priorita": 100,
             "scope_azienda": None,
+            "scope_periodo": None,
             "origine": "estratta_da_pdf",
             "attiva": True,
             "note": "",
@@ -171,10 +197,14 @@ def genera_mappatura_da_voci(
     return nuove
 
 
-def regole_concorrenti(testo_matching: str, regole: list[dict], scope_azienda: str | None = None) -> list[dict]:
+def regole_concorrenti(
+    testo_matching: str, regole: list[dict],
+    scope_azienda: str | None = None, scope_periodo: str | None = None,
+) -> list[dict]:
     """Tutte le regole attive che matcherebbero (per segnalare conflitti)."""
     return [
         r for r in regole
         if r.get("attiva", True) and _applica_pattern(testo_matching, r)
         and (r.get("scope_azienda") in (None, "", scope_azienda))
+        and (r.get("scope_periodo") in (None, "", scope_periodo))
     ]

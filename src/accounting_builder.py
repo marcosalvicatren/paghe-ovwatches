@@ -37,6 +37,7 @@ def costruisci_registrazione_paghe(
     regole: list[dict],
     data_documento: date,
     scope_azienda: str | None = None,
+    scope_periodo: str | None = None,
     causale: str = "LA",
     numero_documento: str = "",
 ) -> tuple[RegistrazioneContabile, list[Eccezione]]:
@@ -48,7 +49,7 @@ def costruisci_registrazione_paghe(
     eccezioni: list[Eccezione] = []
 
     for r in righe:
-        regola = trova_regola(r.descrizione, regole, scope_azienda)
+        regola = trova_regola(r.descrizione, regole, scope_azienda, scope_periodo)
         # IMPORTANTE: il conto del bilancino è quello del software paghe, non
         # necessariamente quello del gestionale di destinazione. Non lo si usa
         # mai come ripiego: senza una mappatura esplicita (conto_override
@@ -76,7 +77,7 @@ def costruisci_registrazione_paghe(
                 causale=causale, pagina_origine=r.pagina, regola_applicata=regola["id"],
             ))
         else:
-            concorrenti = regole_concorrenti(r.descrizione, regole, scope_azienda)
+            concorrenti = regole_concorrenti(r.descrizione, regole, scope_azienda, scope_periodo)
             eccezioni.append(Eccezione(
                 riga_originale=r,
                 motivo="dati_mancanti" if not concorrenti else "piu_regole",
@@ -92,6 +93,7 @@ def costruisci_registrazione_f24(
     conto_contropartita: str,
     data_pagamento: date,
     scope_azienda: str | None = None,
+    scope_periodo: str | None = None,
     causale: str = "LA",
     numero_documento: str = "",
 ) -> tuple[RegistrazioneContabile, list[Eccezione]]:
@@ -103,9 +105,9 @@ def costruisci_registrazione_f24(
     eccezioni: list[Eccezione] = []
 
     for r in righe:
-        regola = trova_regola(r.codice, regole, scope_azienda)
+        regola = trova_regola(r.codice, regole, scope_azienda, scope_periodo)
         if not regola:
-            concorrenti = regole_concorrenti(r.codice, regole, scope_azienda)
+            concorrenti = regole_concorrenti(r.codice, regole, scope_azienda, scope_periodo)
             eccezioni.append(Eccezione(
                 riga_originale=r,
                 motivo="dati_mancanti" if not concorrenti else "piu_regole",
@@ -146,13 +148,12 @@ def costruisci_registrazione_f24(
 def verifica_quadratura(reg: RegistrazioneContabile, eccezioni: list[Eccezione]) -> RisultatoValidazione:
     errori, avvisi = [], []
     if eccezioni:
-        # Bloccante, non solo un avviso: una voce senza conto mappato non è
-        # un dettaglio opzionale, significa che l'XML sarebbe incompleto o
-        # userebbe (per le altre righe) conti del software paghe non validi
-        # nel gestionale. Richiede una mappatura o una forzatura esplicita.
-        errori.append(
-            f"{len(eccezioni)} voce/i senza conto del gestionale assegnato: "
-            "vai su 'Mappatura conti' oppure risolvile qui sotto in 'Eccezioni'."
+        # Segnalazione, non più bloccante: con l'Anteprima scrittura ora
+        # modificabile a mano, l'utente può aggiungere/correggere righe
+        # direttamente lì, bypassando la mappatura automatica se preferisce.
+        avvisi.append(
+            f"{len(eccezioni)} voce/i del documento originale senza conto mappato "
+            "('Mappatura conti', oppure aggiungile a mano qui sotto in Anteprima)."
         )
     if not reg.quadrata:
         errori.append(
