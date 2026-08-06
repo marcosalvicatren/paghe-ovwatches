@@ -110,6 +110,23 @@ già). Una regola serve solo per:
    (l'F24 è una dichiarazione fiscale, non un prospetto contabile) — qui
    `config/rules_f24.json` parte vuoto e va popolato dall'interfaccia.
 
+Ogni mappatura ha un **Ambito**, impostabile direttamente nella tabella:
+- **Generale** — vale per tutte le aziende
+- **Solo questa azienda** — vale solo per l'azienda indicata nella sidebar
+- **Solo questa registrazione** — vale solo per quell'azienda in quel
+  periodo (utile per un'eccezione una tantum, senza sporcare le regole
+  generali). A parità di voce, una regola più specifica vince su una più
+  generale.
+
+### L'Anteprima scrittura è modificabile
+
+Sia in "Buste paga" sia in "F24", la tabella di anteprima prima
+dell'esportazione è completamente modificabile: si possono correggere conto,
+descrizione, importo e Dare/Avere di ogni riga, cancellare righe, o
+aggiungerne di nuove a mano (utile per una scrittura con contropartita non
+derivabile automaticamente dal PDF). Le modifiche restano finché non si
+ri-estrae la pagina o si cambiano le mappature salvate.
+
 ### Aggiungere una nuova regola
 
 Dall'interfaccia, sezione "Eccezioni" di Buste paga o F24: si compila conto e

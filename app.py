@@ -18,11 +18,14 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from models import TipoPagina, DareAvere  # noqa: E402
+from models import TipoPagina, DareAvere, RegistrazioneContabile, MovimentoContabile  # noqa: E402
 from pdf_classifier import classifica_pdf  # noqa: E402
 from payroll_parser import estrai_bilancino  # noqa: E402
 from f24_parser import estrai_f24  # noqa: E402
-from rule_engine import carica_regole, salva_regole, genera_mappatura_da_voci  # noqa: E402
+from rule_engine import (  # noqa: E402
+    carica_regole, salva_regole, genera_mappatura_da_voci,
+    ambito_da_scope, scope_da_ambito, AMBITO_GENERALE, AMBITO_AZIENDA, AMBITO_REGISTRAZIONE,
+)
 from accounting_builder import (  # noqa: E402
     costruisci_registrazione_paghe, costruisci_registrazione_f24, verifica_quadratura,
 )
@@ -63,6 +66,9 @@ for chiave, default in [
     ("bp_righe", None), ("bp_mese", ""), ("bp_azienda", ""),
     ("f24_righe", None), ("f24_saldo", None),
     ("regole_bp", None), ("regole_f24", None),
+    ("bp_mappatura_pronta", False), ("f24_mappatura_pronta", False),
+    ("bp_movimenti", None), ("bp_movimenti_pronti", False),
+    ("f24_movimenti", None), ("f24_movimenti_pronti", False),
 ]:
     if chiave not in st.session_state:
         st.session_state[chiave] = default
@@ -87,6 +93,10 @@ with st.sidebar:
         st.session_state.classificazione = None  # forza ri-classificazione
         st.session_state.bp_righe = None
         st.session_state.f24_righe = None
+        st.session_state.bp_mappatura_pronta = False
+        st.session_state.f24_mappatura_pronta = False
+        st.session_state.bp_movimenti_pronti = False
+        st.session_state.f24_movimenti_pronti = False
 
     azienda_input = st.text_input("Azienda / cliente (per regole specifiche)", value=st.session_state.bp_azienda)
     st.session_state.bp_azienda = azienda_input
@@ -170,7 +180,7 @@ def _pagine_disponibili(tipo: TipoPagina) -> list[int]:
 # SEZIONE — BUSTE PAGA
 # ─────────────────────────────────────────────────────────────────────────
 
-def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix):
+def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix, flag_movimenti):
     if not eccezioni:
         st.success("Nessuna eccezione: tutte le righe hanno trovato una regola.")
         return
@@ -190,38 +200,77 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix):
             conto = c1.text_input("Conto nel gestionale", key=f"{key_prefix}_conto_{i}")
             da = c2.selectbox("Dare/Avere", ["D", "A"], key=f"{key_prefix}_da_{i}")
             ambito = c3.selectbox(
-                "Applica a",
-                ["Solo questa registrazione", "Stessa descrizione (regola generale)",
-                 f"Stessa descrizione, solo per '{st.session_state.bp_azienda}'" if st.session_state.bp_azienda else "Stessa descrizione, solo questa azienda"],
+                "Ambito", [AMBITO_GENERALE, AMBITO_AZIENDA, AMBITO_REGISTRAZIONE],
                 key=f"{key_prefix}_ambito_{i}",
             )
             if st.button("✅ Applica e salva come regola", key=f"{key_prefix}_salva_{i}") and conto:
                 pattern = getattr(r, "descrizione", None) or getattr(r, "codice", "")
+                scope_az, scope_per = scope_da_ambito(ambito, st.session_state.bp_azienda, st.session_state.bp_mese)
                 nuova_regola = {
                     "id": f"{key_prefix}-{abs(hash(pattern)) % 100000}",
                     "tipo_documento": tipo_documento,
                     "descrizione_regola": pattern,
-                    "contiene": [pattern.lower()[:40]],
-                    "non_contiene": [],
+                    "contiene": [], "non_contiene": [],
                     "segno_atteso": da,
                     "conto_override": conto,
                     "priorita": 100,
-                    "scope_azienda": st.session_state.bp_azienda if "azienda" in ambito.lower() and "solo" in ambito.lower() else None,
+                    "scope_azienda": scope_az,
+                    "scope_periodo": scope_per,
                     "origine": "utente",
                     "attiva": True,
                     "creata_il": datetime.now().isoformat(timespec="seconds"),
-                    "note": "" if ambito.startswith("Solo questa") else "regola persistente creata da risoluzione eccezione",
+                    "note": "",
                 }
-                if ambito.startswith("Solo questa"):
-                    st.info("Applicata solo a questa registrazione (non salvata come regola persistente). "
-                            "Rigenera l'XML per includerla.")
+                # se esiste già una mappatura per questa stessa voce, la
+                # aggiorna invece di aggiungerne una seconda identica
+                esistente = next((x for x in regole if x.get("descrizione_regola") == pattern), None)
+                if esistente:
+                    esistente.update(nuova_regola, id=esistente["id"])
                 else:
                     regole.append(nuova_regola)
-                    token, repo, branch = _gh_config()
-                    ok, msg = salva_regole(tipo_documento, regole, token, repo, branch,
-                                            f"Nuova regola: {pattern}")
-                    (st.success if ok else st.error)(msg)
-                    st.rerun()
+                token, repo, branch = _gh_config()
+                ok, msg = salva_regole(tipo_documento, regole, token, repo, branch, f"Mappatura: {pattern}")
+                st.session_state[flag_movimenti] = False  # forza il ricalcolo dell'Anteprima con la nuova mappatura
+                st.toast(msg, icon="✅" if ok else "⚠️")
+                st.rerun()
+
+
+def _tabella_movimenti_editabile(movimenti_dict, key):
+    """Tabella Anteprima scrittura completamente modificabile: valori,
+    righe cancellabili, righe aggiungibili a mano (num_rows='dynamic')."""
+    df = pd.DataFrame(movimenti_dict)
+    for col, default in [("Conto", ""), ("Descrizione", ""), ("Importo", 0.0), ("D/A", "D")]:
+        if col not in df.columns:
+            df[col] = default
+    edited = st.data_editor(
+        df[["Conto", "Descrizione", "Importo", "D/A"]],
+        column_config={
+            "Importo": st.column_config.NumberColumn("Importo (€)", format="%.2f", min_value=0.0, step=0.01),
+            "D/A": st.column_config.SelectboxColumn("Dare/Avere", options=["D", "A"]),
+        },
+        num_rows="dynamic", width='stretch', key=key,
+    )
+    return edited.to_dict("records")
+
+
+def _reg_da_tabella(records, tipo, causale, numero_documento, data_doc) -> RegistrazioneContabile:
+    reg = RegistrazioneContabile(
+        tipo=tipo, causale_contabile=causale, numero_documento=numero_documento,
+        data_documento=data_doc, data_registrazione=data_doc,
+    )
+    for r in records:
+        conto = str(r.get("Conto", "")).strip()
+        if not conto:
+            continue  # riga vuota (es. appena aggiunta e non ancora compilata): ignorata, non esportata
+        try:
+            importo = float(r.get("Importo") or 0)
+        except (TypeError, ValueError):
+            importo = 0.0
+        reg.movimenti.append(MovimentoContabile(
+            conto=conto, descrizione=str(r.get("Descrizione", "") or ""), importo=importo,
+            da=DareAvere(r.get("D/A") or "D"), causale=causale,
+        ))
+    return reg
 
 
 def pagina_buste_paga():
@@ -238,6 +287,8 @@ def pagina_buste_paga():
         try:
             mese, az, righe = estrai_bilancino(st.session_state.pdf_path, pagina_num)
             st.session_state.bp_righe = righe
+            st.session_state.bp_mappatura_pronta = False  # nuova estrazione: rimescola la mappatura una sola volta
+            st.session_state.bp_movimenti_pronti = False  # nuova estrazione: ricalcola l'anteprima una sola volta
             st.session_state.bp_mese = mese
             if az and not st.session_state.bp_azienda:
                 st.session_state.bp_azienda = az
@@ -258,16 +309,26 @@ def pagina_buste_paga():
 
     data_doc = st.date_input("Data registrazione", value=date.today().replace(day=1))
 
-    reg, eccezioni = costruisci_registrazione_paghe(
-        righe, regole, data_doc, scope_azienda=st.session_state.bp_azienda or None
+    # Le eccezioni si ricalcolano sempre (leggero, riflette lo stato attuale
+    # della mappatura). L'Anteprima invece, essendo ora modificabile a mano,
+    # si (ri)calcola dalla mappatura solo una volta per estrazione o dopo
+    # un salvataggio di regole/mappatura — non ad ogni rerun, altrimenti le
+    # modifiche manuali dell'utente verrebbero perse (stesso problema già
+    # risolto per la tabella di mappatura).
+    reg_da_mappatura, eccezioni = costruisci_registrazione_paghe(
+        righe, regole, data_doc, scope_azienda=st.session_state.bp_azienda or None,
+        scope_periodo=st.session_state.bp_mese or None,
     )
+    if not st.session_state.bp_movimenti_pronti:
+        st.session_state.bp_movimenti = [{
+            "Conto": m.conto, "Descrizione": m.descrizione, "Importo": m.importo, "D/A": m.da.value,
+        } for m in reg_da_mappatura.movimenti]
+        st.session_state.bp_movimenti_pronti = True
 
-    _sezione("Passo 2 — Anteprima scrittura")
-    df_mov = pd.DataFrame([{
-        "Conto": m.conto, "Descrizione": m.descrizione, "Importo": m.importo,
-        "D/A": m.da.value, "Regola": m.regola_applicata, "Pagina": m.pagina_origine,
-    } for m in reg.movimenti])
-    st.dataframe(df_mov, width='stretch', hide_index=True)
+    _sezione("Passo 2 — Anteprima scrittura (modificabile: valori, righe cancellabili o aggiungibili a mano)")
+    st.session_state.bp_movimenti = _tabella_movimenti_editabile(st.session_state.bp_movimenti, "editor_bp_movimenti")
+    reg = _reg_da_tabella(st.session_state.bp_movimenti, "paghe", "LA",
+                           f"BP-{data_doc.isoformat().replace('-', '')}", data_doc)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Totale Dare", f"€ {reg.totale_dare:,.2f}")
@@ -275,7 +336,9 @@ def pagina_buste_paga():
     c3.metric("Quadratura", "✅ OK" if reg.quadrata else "❌ Non quadrata")
 
     _sezione("Passo 3 — Eccezioni")
-    _gestisci_eccezioni(eccezioni, "buste_paga", regole, "bp")
+    st.caption("Le voci qui sotto non hanno una mappatura automatica: risolvile qui, oppure "
+               "aggiungile/correggile direttamente nella tabella Anteprima sopra.")
+    _gestisci_eccezioni(eccezioni, "buste_paga", regole, "bp", "bp_movimenti_pronti")
 
     _sezione("Passo 4 — Esportazione XML")
     esito = verifica_quadratura(reg, eccezioni)
@@ -303,7 +366,6 @@ def pagina_buste_paga():
         with st.expander("Anteprima XML"):
             st.code(xml_bytes.decode("utf-8"), language="xml")
 
-
 # ─────────────────────────────────────────────────────────────────────────
 # SEZIONE — F24
 # ─────────────────────────────────────────────────────────────────────────
@@ -322,6 +384,8 @@ def pagina_f24():
         try:
             righe, saldo = estrai_f24(st.session_state.pdf_path, pagina_num)
             st.session_state.f24_righe = righe
+            st.session_state.f24_mappatura_pronta = False  # nuova estrazione: rimescola la mappatura una sola volta
+            st.session_state.f24_movimenti_pronti = False  # nuova estrazione: ricalcola l'anteprima una sola volta
             st.session_state.f24_saldo = saldo
         except ValueError as e:
             st.error(str(e))
@@ -343,17 +407,21 @@ def pagina_f24():
     data_pag = c1.date_input("Data pagamento", value=date.today())
     conto_contropartita = c2.text_input("Conto contropartita (es. banca)", value="")
 
-    reg, eccezioni = costruisci_registrazione_f24(
+    reg_da_mappatura, eccezioni = costruisci_registrazione_f24(
         righe, regole, conto_contropartita, data_pag,
         scope_azienda=st.session_state.bp_azienda or None,
+        scope_periodo=st.session_state.bp_mese or None,
     )
+    if not st.session_state.f24_movimenti_pronti:
+        st.session_state.f24_movimenti = [{
+            "Conto": m.conto, "Descrizione": m.descrizione, "Importo": m.importo, "D/A": m.da.value,
+        } for m in reg_da_mappatura.movimenti]
+        st.session_state.f24_movimenti_pronti = True
 
-    _sezione("Passo 2 — Anteprima scrittura")
-    df_mov = pd.DataFrame([{
-        "Conto": m.conto, "Descrizione": m.descrizione, "Codice tributo": m.codice_tributo,
-        "Importo": m.importo, "D/A": m.da.value,
-    } for m in reg.movimenti])
-    st.dataframe(df_mov, width='stretch', hide_index=True)
+    _sezione("Passo 2 — Anteprima scrittura (modificabile: valori, righe cancellabili o aggiungibili a mano)")
+    st.session_state.f24_movimenti = _tabella_movimenti_editabile(st.session_state.f24_movimenti, "editor_f24_movimenti")
+    reg = _reg_da_tabella(st.session_state.f24_movimenti, "f24", "LA",
+                           f"F24-{data_pag.isoformat().replace('-', '')}", data_pag)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Totale Dare", f"€ {reg.totale_dare:,.2f}")
@@ -361,7 +429,9 @@ def pagina_f24():
     c3.metric("Quadratura", "✅ OK" if reg.quadrata else "❌ Non quadrata")
 
     _sezione("Passo 3 — Eccezioni")
-    _gestisci_eccezioni(eccezioni, "f24", regole, "f24")
+    st.caption("Le voci qui sotto non hanno una mappatura automatica: risolvile qui, oppure "
+               "aggiungile/correggile direttamente nella tabella Anteprima sopra.")
+    _gestisci_eccezioni(eccezioni, "f24", regole, "f24", "f24_movimenti_pronti")
 
     _sezione("Passo 4 — Esportazione XML")
     esito = verifica_quadratura(reg, eccezioni)
@@ -401,35 +471,48 @@ def pagina_regole():
     st.caption(
         "Il PDF paghe usa i codici conto del software paghe: NON sono gli stessi conti del tuo "
         "gestionale. Per ogni voce indica qui il conto corretto del gestionale — finché una voce "
-        "non ha un conto, resta in 'Eccezioni' e non entra nell'XML."
+        "non ha un conto, resta in 'Eccezioni' e non entra nell'XML. Per cancellare una riga: "
+        "seleziona il quadratino a sinistra della riga, poi premi Canc/Delete sulla tastiera."
     )
     token, repo, branch = _gh_config()
 
     tab_bp, tab_f24 = st.tabs(["Buste paga", "F24"])
-    for tab, tipo, chiave, righe_chiave in [
-        (tab_bp, "buste_paga", "regole_bp", "bp_righe"),
-        (tab_f24, "f24", "regole_f24", "f24_righe"),
+    for tab, tipo, chiave, righe_chiave, flag_chiave, flag_movimenti in [
+        (tab_bp, "buste_paga", "regole_bp", "bp_righe", "bp_mappatura_pronta", "bp_movimenti_pronti"),
+        (tab_f24, "f24", "regole_f24", "f24_righe", "f24_mappatura_pronta", "f24_movimenti_pronti"),
     ]:
         with tab:
             if st.session_state[chiave] is None:
                 st.session_state[chiave] = carica_regole(tipo, token, repo, branch)
 
-            # precompila con le voci reali già estratte in questa sessione,
-            # così la tabella non parte vuota: mostra esattamente le voci
-            # del TUO PDF, non un elenco astratto.
-            righe_estratte = st.session_state.get(righe_chiave)
-            if righe_estratte:
-                campo = "descrizione" if tipo == "buste_paga" else "codice"
-                voci = [getattr(r, campo) for r in righe_estratte]
-                st.session_state[chiave] = genera_mappatura_da_voci(voci, tipo, st.session_state[chiave])
+            # Precompila con le voci reali del PDF una SOLA volta per
+            # estrazione (guardia con flag), non ad ogni rerun della pagina:
+            # rigenerarla sempre andrebbe in conflitto con le modifiche che
+            # l'utente sta facendo nella tabella (righe cancellate che
+            # ricomparivano, D/A che si scambiavano, doppioni) perché
+            # ricreare il dataframe sottostante a ogni interazione confonde
+            # lo stato interno di st.data_editor quando si usa una key fissa.
+            if not st.session_state[flag_chiave]:
+                righe_estratte = st.session_state.get(righe_chiave)
+                if righe_estratte:
+                    campo = "descrizione" if tipo == "buste_paga" else "codice"
+                    voci = [getattr(r, campo) for r in righe_estratte]
+                    st.session_state[chiave] = genera_mappatura_da_voci(voci, tipo, st.session_state[chiave])
+                st.session_state[flag_chiave] = True
 
             df = pd.DataFrame(st.session_state[chiave])
             for col in ["descrizione_regola", "conto_override", "segno_atteso", "attiva",
-                        "contiene", "non_contiene", "priorita", "scope_azienda", "note"]:
+                        "contiene", "non_contiene", "priorita", "scope_azienda", "scope_periodo"]:
                 if col not in df.columns:
                     df[col] = "" if col not in ("attiva", "priorita") else (True if col == "attiva" else 100)
             df["contiene"] = df["contiene"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
             df["non_contiene"] = df["non_contiene"].apply(lambda x: ", ".join(x) if isinstance(x, list) else x)
+            # colonna "Ambito" calcolata per la visualizzazione: traduce le
+            # due colonne tecniche (scope_azienda/scope_periodo) in un'unica
+            # scelta comprensibile, come richiesto.
+            df["ambito"] = df.apply(
+                lambda r: ambito_da_scope(r.get("scope_azienda") or None, r.get("scope_periodo") or None), axis=1
+            )
 
             n_da_mappare = int((df["conto_override"].astype(str).str.strip() == "").sum())
             if n_da_mappare:
@@ -437,10 +520,10 @@ def pagina_regole():
             else:
                 st.success("Tutte le voci hanno un conto assegnato.")
 
-            avanzate = st.checkbox("Mostra colonne avanzate (pattern, priorità, azienda specifica...)",
+            avanzate = st.checkbox("Mostra colonne avanzate (pattern testuale, priorità...)",
                                     key=f"avanzate_{tipo}")
-            colonne_semplici = ["descrizione_regola", "conto_override", "segno_atteso", "attiva"]
-            colonne_avanzate = colonne_semplici + ["contiene", "non_contiene", "priorita", "scope_azienda", "note"]
+            colonne_semplici = ["descrizione_regola", "conto_override", "segno_atteso", "ambito", "attiva"]
+            colonne_avanzate = colonne_semplici + ["contiene", "non_contiene", "priorita"]
 
             edited = st.data_editor(
                 df,
@@ -454,11 +537,15 @@ def pagina_regole():
                     "segno_atteso": st.column_config.SelectboxColumn(
                         "Dare/Avere", options=["", "D", "A"],
                         help="Da compilare solo se questa voce non ha già un D/A esplicito sul PDF."),
+                    "ambito": st.column_config.SelectboxColumn(
+                        "Ambito", options=[AMBITO_GENERALE, AMBITO_AZIENDA, AMBITO_REGISTRAZIONE], width="medium",
+                        help=f"Generale: vale per tutte le aziende. Solo questa azienda: vale solo per "
+                             f"'{st.session_state.bp_azienda or '(nessuna azienda impostata)'}'. Solo questa "
+                             f"registrazione: vale solo per il periodo '{st.session_state.bp_mese or '(nessun periodo impostato)'}' di quell'azienda."),
                     "attiva": st.column_config.CheckboxColumn("Attiva"),
                     "contiene": st.column_config.TextColumn("Pattern aggiuntivo (avanzato)", width="medium"),
                     "non_contiene": st.column_config.TextColumn("NON contiene (avanzato)", width="medium"),
                     "priorita": st.column_config.NumberColumn("Priorità"),
-                    "scope_azienda": st.column_config.TextColumn("Solo per azienda (vuoto = tutte)"),
                 },
                 num_rows="dynamic", width='stretch', key=f"editor_{tipo}",
             )
@@ -467,9 +554,17 @@ def pagina_regole():
                 for r in nuove:
                     r["contiene"] = [x.strip() for x in str(r.get("contiene", "")).split(",") if x.strip()]
                     r["non_contiene"] = [x.strip() for x in str(r.get("non_contiene", "")).split(",") if x.strip()]
+                    scope_az, scope_per = scope_da_ambito(
+                        r.get("ambito", AMBITO_GENERALE), st.session_state.bp_azienda, st.session_state.bp_mese
+                    )
+                    r["scope_azienda"] = scope_az
+                    r["scope_periodo"] = scope_per
+                    r.pop("ambito", None)
                 st.session_state[chiave] = nuove
+                st.session_state[flag_movimenti] = False  # forza il ricalcolo dell'Anteprima con la mappatura aggiornata
                 ok, msg = salva_regole(tipo, nuove, token, repo, branch, f"Aggiornamento mappatura {tipo}")
-                (st.success if ok else st.error)(msg)
+                st.toast(msg, icon="✅" if ok else "⚠️")  # st.toast sopravvive al rerun, st.success no
+                st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────
