@@ -1,0 +1,14 @@
+streamlit>=1.61.0
+# pin necessario: streamlit 1.61.0 include un bug nel proprio middleware di
+# compressione gzip che si scontra con starlette>=1.0 (TypeError:
+# GZipResponder.__init__() missing 1 required keyword-only argument:
+# 'thread_minimum_size'). Verificato: con starlette<1.0 il problema non si presenta.
+starlette<1.0
+pdfplumber>=0.11.9
+lxml>=6.0.2
+pandas>=2.2.0
+requests>=2.33.0
+PyYAML>=6.0
+
+# sviluppo / test
+pytest>=9.1.1
