@@ -8,6 +8,7 @@ automaticamente; le regole di contabilizzazione sono in config/rules_*.json
 secrets di Streamlit, altrimenti gestite in locale).
 """
 
+import os
 import sys
 import tempfile
 import calendar
@@ -24,7 +25,7 @@ from pdf_classifier import classifica_pdf  # noqa: E402
 from payroll_parser import estrai_bilancino  # noqa: E402
 from f24_parser import estrai_f24  # noqa: E402
 from rule_engine import (  # noqa: E402
-    carica_regole, salva_regole, genera_mappatura_da_voci,
+    carica_regole, salva_regole, genera_mappatura_da_voci, verifica_connessione_github,
     ambito_da_scope, scope_da_ambito, AMBITO_GENERALE, AMBITO_AZIENDA, AMBITO_REGISTRAZIONE,
 )
 from accounting_builder import (  # noqa: E402
@@ -100,6 +101,34 @@ for chiave, default in [
 # SIDEBAR — caricamento PDF + navigazione
 # ─────────────────────────────────────────────────────────────────────────
 
+def _cancella_pdf_temporaneo():
+    """Elimina dal disco il PDF caricato in precedenza. Non viene cancellato
+    automaticamente da Streamlit: bisogna farlo esplicitamente, altrimenti
+    resta sul disco del container finché non si riavvia."""
+    path = st.session_state.get("pdf_path")
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _cancella_tutti_i_dati_sessione():
+    """Cancella PDF temporaneo e tutti i dati derivati da questa sessione
+    (righe estratte, anteprime, classificazione). NON tocca le regole/
+    mappature salvate: quelle sono una scelta esplicita dell'utente, non un
+    dato personale del documento."""
+    _cancella_pdf_temporaneo()
+    for chiave in ["pdf_path", "pdf_name", "classificazione", "bp_righe", "f24_righe",
+                   "bp_movimenti", "f24_movimenti", "bp_mese", "f24_saldo"]:
+        st.session_state[chiave] = None
+    st.session_state.bp_azienda = ""
+    st.session_state.bp_mappatura_pronta = False
+    st.session_state.f24_mappatura_pronta = False
+    st.session_state.bp_movimenti_pronti = False
+    st.session_state.f24_movimenti_pronti = False
+
+
 with st.sidebar:
     st.markdown("### 📋 Prima Nota Paghe & F24")
     st.caption("GB Software · Wolters Kluwer")
@@ -107,6 +136,7 @@ with st.sidebar:
 
     pdf_file = st.file_uploader("PDF multipagina", type=["pdf"])
     if pdf_file is not None and pdf_file.name != st.session_state.pdf_name:
+        _cancella_pdf_temporaneo()  # tolgo dal disco il PDF precedente, se c'era
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         tmp.write(pdf_file.read())
         tmp.close()
@@ -132,8 +162,18 @@ with st.sidebar:
     token, repo, branch = _gh_config()
     if repo:
         st.caption(f"Regole sincronizzate su GitHub: `{repo}` ({branch})")
+        if st.button("🔍 Verifica connessione GitHub", width='stretch'):
+            ok, msg = verifica_connessione_github(token, repo, branch)
+            (st.success if ok else st.error)(msg)
     else:
         st.caption("GitHub non configurato — le regole sono salvate in `config/rules_*.json` in locale.")
+
+    st.divider()
+    if st.session_state.pdf_path is not None:
+        st.caption("Il PDF caricato resta sul disco del server finché non lo cancelli o non ricarichi la pagina del browser.")
+        if st.button("🗑️ Cancella PDF e dati di questa sessione", width='stretch'):
+            _cancella_tutti_i_dati_sessione()
+            st.rerun()
 
 
 if st.session_state.pdf_path is None:
@@ -254,9 +294,12 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix, flag_movi
                     regole.append(nuova_regola)
                 token, repo, branch = _gh_config()
                 ok, msg = salva_regole(tipo_documento, regole, token, repo, branch, f"Mappatura: {pattern}")
-                st.session_state[flag_movimenti] = False  # forza il ricalcolo dell'Anteprima con la nuova mappatura
-                st.toast(msg, icon="✅" if ok else "⚠️")
-                st.rerun()
+                if ok:
+                    st.session_state[flag_movimenti] = False  # forza il ricalcolo dell'Anteprima con la nuova mappatura
+                    st.toast(msg, icon="✅")
+                    st.rerun()
+                else:
+                    st.error(msg)  # persistente: NON rerunno, altrimenti l'errore sparirebbe subito
 
             if c5.button("🚫 Escludi questa voce (non mappare, di proposito)", key=f"{key_prefix}_escludi_{i}"):
                 pattern = getattr(r, "descrizione", None) or getattr(r, "codice", "")
@@ -283,9 +326,12 @@ def _gestisci_eccezioni(eccezioni, tipo_documento, regole, key_prefix, flag_movi
                     regole.append(nuova_regola)
                 token, repo, branch = _gh_config()
                 ok, msg = salva_regole(tipo_documento, regole, token, repo, branch, f"Esclusa: {pattern}")
-                st.session_state[flag_movimenti] = False
-                st.toast(msg, icon="✅" if ok else "⚠️")
-                st.rerun()
+                if ok:
+                    st.session_state[flag_movimenti] = False
+                    st.toast(msg, icon="✅")
+                    st.rerun()
+                else:
+                    st.error(msg)
 
 
 def _tabella_movimenti_editabile(movimenti_dict, key):
@@ -635,8 +681,11 @@ def pagina_regole():
                 st.session_state[chiave] = nuove
                 st.session_state[flag_movimenti] = False  # forza il ricalcolo dell'Anteprima con la mappatura aggiornata
                 ok, msg = salva_regole(tipo, nuove, token, repo, branch, f"Aggiornamento mappatura {tipo}")
-                st.toast(msg, icon="✅" if ok else "⚠️")  # st.toast sopravvive al rerun, st.success no
-                st.rerun()
+                if ok:
+                    st.toast(msg, icon="✅")  # st.toast sopravvive al rerun, st.success no
+                    st.rerun()
+                else:
+                    st.error(msg)  # persistente: NON rerunno, altrimenti l'errore sparirebbe subito
 
 
 # ─────────────────────────────────────────────────────────────────────────
