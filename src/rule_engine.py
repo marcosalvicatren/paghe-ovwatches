@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime
 import os
 from pathlib import Path
 
@@ -84,9 +85,13 @@ def gh_scrivi(filename: str, contenuto, messaggio: str, token: str | None, repo:
 
 
 def verifica_connessione_github(token: str | None, repo: str | None, branch: str) -> tuple[bool, str]:
-    """Diagnostica esplicita della configurazione GitHub: dice esattamente
-    cosa non va (repo non trovato, token senza permessi di scrittura, branch
-    inesistente) invece di scoprirlo solo al momento di un salvataggio fallito."""
+    """Diagnostica esplicita della configurazione GitHub. Esegue un vero
+    tentativo di scrittura (non un controllo indiretto dei permessi): per i
+    token fine-grained, il campo 'permissions' restituito da GET /repos/{repo}
+    riflette i permessi generali dell'account sul repository (per un
+    proprietario, sempre push=true), NON quelli specifici concessi a QUEL
+    token — un controllo basato su quel campo può quindi dare un falso 'OK'
+    anche quando il token non ha alcun accesso reale in scrittura."""
     if not token or not repo:
         return False, "GITHUB_TOKEN o GITHUB_REPO non impostati nei secrets di Streamlit."
     headers = _gh_headers(token)
@@ -102,12 +107,6 @@ def verifica_connessione_github(token: str | None, repo: str | None, branch: str
     if r.status_code != 200:
         return False, f"Errore {r.status_code} contattando GitHub: {r.json().get('message', '')}"
 
-    permessi = r.json().get("permissions", {})
-    if not permessi.get("push"):
-        return False, (f"Il token vede '{repo}' ma NON ha il permesso di scrittura. Nel token fine-grained "
-                        f"su GitHub, sotto 'Repository permissions', il permesso 'Contents' deve essere "
-                        f"impostato su 'Read and write', non solo 'Read-only'.")
-
     try:
         r2 = requests.get(f"https://api.github.com/repos/{repo}/branches/{branch}", headers=headers, timeout=10)
     except requests.RequestException as e:
@@ -115,7 +114,23 @@ def verifica_connessione_github(token: str | None, repo: str | None, branch: str
     if r2.status_code == 404:
         return False, f"Il branch '{branch}' non esiste in '{repo}'. Controlla il nome esatto (es. 'main' oppure 'master')."
 
-    return True, f"Connessione OK: scrittura confermata su '{repo}' (branch '{branch}')."
+    # Test di scrittura reale: crea/aggiorna un piccolo file marker. È l'unico
+    # modo affidabile di sapere se il token può davvero scrivere.
+    ok, msg = gh_scrivi(
+        "regole/_verifica_connessione.json",
+        {"ultima_verifica": datetime.now().isoformat(timespec="seconds")},
+        "Verifica connessione (automatica)", token, repo, branch,
+    )
+    if not ok:
+        if "403" in msg:
+            return False, (f"Il repository e il branch sono corretti, ma il token NON ha il permesso di "
+                            f"scrittura reale (errore 403 al tentativo di scrivere). Nel token fine-grained "
+                            f"su GitHub, sotto 'Repository permissions', il permesso 'Contents' deve essere "
+                            f"impostato su 'Read and write', e il repository deve essere incluso sotto "
+                            f"'Repository access'.")
+        return False, f"Test di scrittura fallito: {msg}"
+
+    return True, f"Connessione OK: scrittura VERIFICATA con un salvataggio reale su '{repo}' (branch '{branch}')."
 
 
 def carica_regole(tipo: str, token: str | None = None, repo: str | None = None, branch: str = "main") -> list[dict]:
